@@ -163,3 +163,6 @@ venv.bak/
 
 # pytest
 .pytest_cache/
+
+# Serverless directories
+.serverless
