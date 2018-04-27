@@ -53,3 +53,4 @@ pip install -t vendored/ -r requirements.txt
 serverless deploy --stage=dev
 serverless invoke -f wg_ges_bot_tor_6_cities --log
 ```
+TODO: Get around timeout of AWS Lambdas (endless loop)
