@@ -20,6 +20,14 @@ service: wg-ges-bot
 provider:
   name: aws
   runtime: python3.6
+package:
+  exclude:
+    - ./**
+  include:
+    - wg_ges_bot_tor_6_cities.py
+    - wg_ges_bot.py
+    - params.py
+    - vendored/**
 
 # you can overwrite defaults here
 #  stage: dev
@@ -55,8 +63,8 @@ provider:
 #    - exclude-me-dir/**
 
 functions:
-  hello:
-    handler: handler.hello
+  wg_ges_bot_tor_6_cities:
+    handler: wg_ges_bot_tor_6_cities.main
 
 #    The following are a few example events you can configure
 #    NOTE: Please make sure to change your handler code to work with those events

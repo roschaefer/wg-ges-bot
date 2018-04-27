@@ -30,3 +30,26 @@ me. I'll help you with the small code changes, but you'll need to run it yoursel
 Disclaimer:  
 I'm not connected to [wg-gesucht.de](). I don't save any of your data or give it to others. I don't make any money with 
 this, nor do i plan to ever do so. I don't intend to inflict any damage to you, [wg-gesucht.de]() or others.
+
+### Local setup
+```
+source env/bin/activate
+pip install -r requirements.txt
+cp params_template.py params.py
+```
+Edit `params.py` with your bot's API token.
+
+Then run:
+```
+python wg_ges_bot_tor_6_cities.py
+```
+
+And chat with your bot
+
+### Serverless Deployment 
+```sh
+source env/bin/activate
+pip install -t vendored/ -r requirements.txt
+serverless deploy --stage=dev
+serverless invoke -f wg_ges_bot_tor_6_cities --log
+```

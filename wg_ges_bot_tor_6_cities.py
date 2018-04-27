@@ -1,3 +1,8 @@
+import sys, os
+# get this file's directory independent of where it's run from
+here = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.path.join(here, "vendored"))
+
 from wg_ges_bot import Ad, Subscriber, FilterRent, FilterGender, FilterAvailability, FilterCity
 from telegram.ext import CommandHandler, Updater, Filters, JobQueue, Job
 from telegram import Bot, Update, ParseMode
@@ -443,7 +448,7 @@ def error(bot: Bot, update: Update, error):
     logging.warning('Update "%s" caused error "%s"', update, error)
 
 
-if __name__ == '__main__':
+def main(event, context):
     # stemlogger spammed a lot and i failed setting it to only warnings
     stemlogger = stem.util.log.get_logger()
     stemlogger.disabled = True
@@ -506,3 +511,6 @@ if __name__ == '__main__':
 
     # to make killing per ctrl+c possible
     updater.idle()
+
+if __name__ == '__main__':
+    main(None, None)

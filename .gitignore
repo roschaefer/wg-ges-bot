@@ -166,3 +166,4 @@ venv.bak/
 
 # Serverless directories
 .serverless
+vendored/
