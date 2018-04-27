@@ -3,10 +3,13 @@ import sys, os
 here = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(here, "vendored"))
 
-from wg_ges_bot import Ad, Subscriber, FilterRent, FilterGender, FilterAvailability, FilterCity
+from wg_ges_bot import Ad, Subscriber, FilterRent, FilterGender, \
+    FilterAvailability, FilterCity, FilterAvailableFrom, FilterAvailableTo
+
 from telegram.ext import CommandHandler, Updater, Filters, JobQueue, Job
 from telegram import Bot, Update, ParseMode
-from telegram.error import Unauthorized
+from telegram.error import Unauthorized, TimedOut
+
 from collections import defaultdict
 import datetime
 import logging
@@ -17,9 +20,8 @@ from torrequest import TorRequest
 from bs4 import BeautifulSoup
 from random import uniform
 from fake_useragent import UserAgent
-import json
 from textwrap import wrap
-from typing import List
+from typing import List, Dict, Any
 
 # import some secret params from other file
 import params
@@ -39,13 +41,13 @@ max_consecutive_tor_reqs = 2000
 consecutive_tor_reqs = 0
 torip = None
 
-subscribers = {}
+subscribers: Dict[int, Subscriber] = {}
 current_ads = defaultdict(dict)
 
 # person with permission to start and stop scraper and debugging commands
 admin_chat_id = params.admin_chat_id
 
-lock = Lock()
+tor_lock = Lock()
 
 
 def get_current_ip(tr):
@@ -72,7 +74,7 @@ def tor_request(url: str):
         'User-Agent': ua.random,
     }
     with TorRequest(proxy_port=9050, ctrl_port=9051, password=params.tor_pwd) as tr:
-        with lock:
+        with tor_lock:
             time.sleep(uniform(TIME_BETWEEN_REQUESTS, TIME_BETWEEN_REQUESTS + 2))
             page = tr.get(url, headers=headers)
             if 'Nutzungsaktivitäten, die den Zweck haben' in page.text:
@@ -99,7 +101,7 @@ def get_ads_from_listings(listings: List[BeautifulSoup], city: str, first_run=Fa
     for listing in listings:
         links = listing.find_all('a', class_='detailansicht')
         link_to_offer = 'https://www.wg-gesucht.de/{}'.format(links[0].get_attribute_list('href')[0])
-        logging.info('new offer: {}'.format(link_to_offer))
+        # logging.info('new offer: {}'.format(link_to_offer))
 
         price_wrapper = listing.find(class_="detail-size-price-wrapper")
         link_named_price = price_wrapper.find(class_="detailansicht")
@@ -242,31 +244,36 @@ def subscribe_city_cmd(bot: Bot, update: Update, job_queue: JobQueue, chat_data,
     if city in all_cities:
         chat_id = update.message.chat_id
         if chat_id in subscribers and subscribers[chat_id].is_subscribed(city):
-            update.message.reply_text('Das Abo lief schon. /unsubscribe für Stille im Postfach oder um die Stadt zu '
-                                      'wechseln.')
+            update.message.reply_text('Dein Abo für {} lief schon. /unsubscribe für Stille im Postfach.'.format(city))
         else:
             context = {'chat_id': chat_id, 'city': city}
             job = job_queue.run_repeating(callback=job_notify_subscriber, interval=15, first=1, context=context)
             try:
-                chat_data['job'] = job
+                try:
+                    old_jobs = chat_data['jobs']
+                    if old_jobs is None:
+                        old_jobs = []
+                except KeyError:
+                    old_jobs = []
+                old_jobs.append(job)
+                chat_data['jobs'] = old_jobs
             except Unauthorized:
                 logging.warning('unauthorized in job notify. removing job')
                 job.schedule_removal()
                 return
-            if not chat_id in subscribers:
+
+            if chat_id not in subscribers:
                 subscribers[chat_id] = Subscriber(chat_id)
-            subscriber = subscribers[chat_id]
-            subscriber.subscribe(city)
+            subscribers[chat_id].subscribe(city)
 
             logging.info('{} subbed {}'.format(chat_id, city))
             update.message.reply_text(
-                'Erfolgreich {} abboniert, jetzt heißt es warten auf die neue Bude.\n'
-                'Zieh die Mietpreisbremse in deinem Kopf und erhalte keine Anzeigen mehr, die du dir eh nicht '
-                'leisten kannst mit /filter_rent. Bsp: "/filter_rent 500" für Anzeigen bis 500€.\n'
-                'Mit /filter_sex kannst du Angebote herausfiltern, die nicht für dein Geschlecht sind. Bsp: '
-                '"/filter_sex m" oder eben w.\n'
-                'Beende Benachrichtigungen mit /unsubscribe. Über Feedback oder Fehler an wg-ges-bot@web.de würde ich '
-                'mich freuen'.format(city)
+                'Erfolgreich {} abboniert, du liegst jetzt auf der Lauer. Nützliche Filter Beispiele:\n'
+                '"/filter_rent 500" - nur Anzeigen bis 500€\n'
+                '"/filter_sex m" - keine Anzeigen die nur Frauen suchen\n'
+                '"/filter_from 16.03.2018" - keine Anzeigen die erst später frei werden. Datumsformat muss stimmen.\n'
+                '"/filter_to 17.03.2018" - keine Anzeigen die nur kürzer frei sind. Datumsformat muss stimmen.\n'
+                '"/unsubscribe" - Stille'.format(city)
             )
     else:
         if city == '':
@@ -281,23 +288,24 @@ def subscribe_city_cmd(bot: Bot, update: Update, job_queue: JobQueue, chat_data,
 def unsubscribe_cmd(bot: Bot, update: Update, chat_data):
     chat_id = update.message.chat_id
     try:
-        if 'job' not in chat_data:
+        if 'jobs' not in chat_data:
+            # if 'jobs' not in chat_data:
             update.message.reply_text(
-                'Du hast kein aktives Abo, das ich beenden könnte. Erhalte Benachrichtigungen mit /subscribe '
-                '_Stadtkürzel_. Verfügbare Städte: {}.'.format(all_cities_string),
+                'Du hast kein aktives Abo, das ich beenden könnte. Erhalte Benachrichtigungen mit "/subscribe '
+                '_Stadtkürzel_". Verfügbare Städte: {}.'.format(all_cities_string),
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
-            logging.info('{} unsubbed'.format(chat_id))
-            subscribers.pop(chat_id)
-            job = chat_data['job']
-            job.schedule_removal()
-            del chat_data['job']
+            for job in chat_data['jobs']:
+                job.schedule_removal()
+            del chat_data['jobs']
 
+            subscribers.pop(chat_id)
+
+            logging.info('{} unsubbed'.format(chat_id))
             update.message.reply_text(
                 'Abo erfolgreich beendet - Du hast deine TraumWG hoffentlich gefunden. Wenn ich dir dabei geholfen habe'
-                ', dann schreib mir an wg-ges-bot@web.de. Ich würde mich freuen. Wenn du mir aus '
-                'Freude darüber sogar eine Spezi (nur Paulaner!) ausgeben möchtest, dann schreib mir gerne auch :)\n'
+                ', dann schreib mir eine frohe Mail an wg-ges-bot@web.de und lad mich zur Einweihungsparty ein!\n'
                 'Um erneut per /subscribe zu abonnieren musst du einige Sekunden warten.'
             )
     except Unauthorized:
@@ -307,16 +315,17 @@ def unsubscribe_cmd(bot: Bot, update: Update, chat_data):
 def filter_rent(bot: Bot, update: Update):
     chat_id = update.message.chat_id
     query = ''
+
+    helptext = 'Nutzung: /filter_rent <max Miete>. Bsp: /filter_rent 540\n' \
+               'Mietenfilter zurücksetzen per "/filter_rent 0"'
+
     try:
         query = update.message.text[13:].replace('€', '')
         rent = int(query)
     except Exception as e:
         logging.info('something failed at /filter_rent: {}'.format(e))
 
-        update.message.reply_text(
-            'Nutzung: /filter_rent <max Miete>. Bsp: /filter_rent 540\n'
-            'Mietenfilter zurücksetzen per "/filter_rent 0"'
-        )
+        update.message.reply_text(helptext)
     else:
         if rent:
             subscribers[chat_id].add_filter(FilterRent, rent)
@@ -327,20 +336,27 @@ def filter_rent(bot: Bot, update: Update):
             )
         # case rent = 0 -> reset filter
         else:
-            logging.info('{} reset rent filter'.format(chat_id))
-            update.message.reply_text('Max Miete Filter erfolgreich zurückgesetzt.')
+            try:
+                subscribers[chat_id].remove_filter(FilterRent)
+            except KeyError:
+                logging.info('{} tried to reset rent filter but it wasnt set'.format(chat_id))
+                update.message.reply_text('Kein Filter zum Zurücksetzen vorhanden\n{}'.format(helptext))
+            else:
+                logging.info('{} reset rent filter'.format(chat_id))
+                update.message.reply_text('Max Miete Filter erfolgreich zurückgesetzt.')
 
 
 def filter_sex(bot: Bot, update: Update):
     chat_id = update.message.chat_id
     sex = ''
+
+    helptext = 'Nutzung: /filter_sex <dein Geschlecht>, also "/filter_sex m" oder "/filter_sex w"\n' \
+               'Geschlechterfilter zurücksetzen per "/filter_sex 0"'
+
     try:
-        sex = update.message.text[12:].lower()
+        sex = update.message.text[12:].lower()  # length of "/filter_sex "
     except Exception as e:
         logging.info('something failed at /filter_sex: {}'.format(e))
-
-        helptext = 'Nutzung: /filter_sex <dein Geschlecht>, also "/filter_sex m" oder "/filter_sex w"\n' \
-                   'Geschlechterfilter zurücksetzen per "/filter_sex 0"'
 
         update.message.reply_text(helptext)
     else:
@@ -353,12 +369,17 @@ def filter_sex(bot: Bot, update: Update):
             }
             update.message.reply_text(
                 'Alles klar, du bekommst ab jetzt nur noch Angebote für {}.\n'
-                'Zum zurücksetzen des Filters "/filter_sex 0" schreiben.'.format(sex_verbose[sex])
+                'Zum Filter zurücksetzen "/filter_sex 0" schreiben.'.format(sex_verbose[sex])
             )
         elif sex == '0':
-            subscribers[chat_id].remove_filter(FilterGender)
-            logging.info('{} reset sex filter'.format(chat_id))
-            update.message.reply_text('Gut, du bekommst ab jetzt wieder Angebote für Männer, sowie für Frauen.')
+            try:
+                subscribers[chat_id].remove_filter(FilterGender)
+            except KeyError:
+                logging.info('{} tried to reset sex filter but it wasnt set'.format(chat_id))
+                update.message.reply_text('Kein Filter zum Zurücksetzen vorhanden\n{}'.format(helptext))
+            else:
+                logging.info('{} reset sex filter'.format(chat_id))
+                update.message.reply_text('Gut, du bekommst ab jetzt wieder Angebote für Männer, sowie für Frauen.')
         else:
             helptext = 'Nutzung: /filter_sex <dein Geschlecht>, also "/filter_sex m" oder "/filter_sex w"\n' \
                        'Geschlechterfilter zurücksetzen per "/filter_sex 0"'
@@ -366,19 +387,84 @@ def filter_sex(bot: Bot, update: Update):
             update.message.reply_text(helptext)
 
 
+def filter_from(bot: Bot, update: Update):
+    chat_id = update.message.chat_id
+    needed_from = ''
+    helptext = 'Nutzung: /filter_from <Datum>, zb "/filter_from 14.01.2019". Das Datumsformat muss stimmen.\n' \
+               'So bekommst du bspw. keine Anzeigen die erst ab 1.02.19 frei sind.'
+
+    try:
+        needed_from = update.message.text[13:].lower()
+    except Exception as e:
+        logging.info('something failed at /filter_from: {}'.format(e))
+        update.message.reply_text(helptext)
+    else:
+        if needed_from == '0':
+            try:
+                subscribers[chat_id].remove_filter(FilterAvailableFrom)
+            except KeyError:
+                logging.info('{} tried to reset avail_from filter but it wasnt set'.format(chat_id))
+                update.message.reply_text('Kein Filter zum Zurücksetzen vorhanden\n{}'.format(helptext))
+            else:
+                logging.info('{} reset avail_from filter'.format(chat_id))
+                update.message.reply_text('filter_from zurückgesetzt. Du bekommst wieder Angebote die ab jeglichem '
+                                          'Zeitpunkt frei sind.')
+        else:
+            try:
+                needed_from_date = datetime.datetime.strptime(needed_from, Ad.datetime_format)
+            except Exception as e:
+                logging.info('something failed in /filter_from: {}'.format(e))
+                update.message.reply_text(helptext)
+            else:
+                subscribers[chat_id].add_filter(FilterAvailableFrom, param=needed_from_date)
+                logging.info('{} set avail_from filter to {}'.format(chat_id, needed_from))
+                update.message.reply_text('Gut, du bekommst nur noch Anzeigen die spätestens ab {} frei sind.\n'
+                                          'Zum Filter zurücksetzen "/filter_from 0" schreiben.'.format(needed_from))
+
+
+def filter_to(bot: Bot, update: Update):
+    chat_id = update.message.chat_id
+    needed_until = ''
+    helptext = 'Nutzung: /filter_to <Datum>, zb "/filter_to 14.01.2019". Das Datumsformat muss stimmen.\n' \
+               'So bekommst du bspw. keine Anzeigen die nur bis 23.12.2018 frei sind.'
+
+    try:
+        needed_until = update.message.text[11:].lower()
+    except Exception as e:
+        logging.info('something failed at /filter_to: {}'.format(e))
+        update.message.reply_text(helptext)
+    else:
+        if needed_until == '0':
+            try:
+                subscribers[chat_id].remove_filter(FilterAvailableTo)
+            except KeyError:
+                logging.info('{} tried to reset avail_to filter but it wasnt set'.format(chat_id))
+                update.message.reply_text('Kein Filter zum Zurücksetzen vorhanden\n{}'.format(helptext))
+            else:
+                logging.info('{} reset avail_to filter'.format(chat_id))
+                update.message.reply_text('filter_to zurückgesetzt. Du bekommst wieder Angebote die bis zu jeglichem '
+                                          'Zeitpunkt frei sind.')
+        else:
+            try:
+                needed_until_date = datetime.datetime.strptime(needed_until, Ad.datetime_format)
+            except Exception as e:
+                logging.info('something failed in /filter_to: {}'.format(e))
+                update.message.reply_text(helptext)
+            else:
+                subscribers[chat_id].add_filter(FilterAvailableTo, param=needed_until_date)
+                logging.info('{} set avail_to filter to {}'.format(chat_id, needed_until))
+                update.message.reply_text('Gut, du bekommst nur noch Anzeigen die mindestens bis {} frei sind.\n'
+                                          'Zum Filter zurücksetzen "/filter_to 0" schreiben.'.format(needed_until))
+
+
 def start(bot: Bot, update: Update):
     update.message.reply_text(
-        'Sei gegrüßt, _Mensch_\n'
-        'ich bin dein Telegram Helferchen Bot für wg-gesucht.de.\n'
-        'Die Benutzung ist kinderleicht: /subscribe <Stadtkürzel> um Nachrichten zu neuen Anzeigen zu erhalten und '
-        '/unsubscribe, sobald du diese nicht mehr benötigst. Städte sind: {}.\n'
-        'Ich wünsche viel Erfolg für die Wohnungssuche und hoffe, ich kann dir dabei eine Hilfe sein.\n'
-        '_Beep Boop_\n\n'
-        'Ich bin *NICHT* von wg-gesucht, sondern ein privates Projekt, um Wohnungssuchenden zu helfen. Mit mir werden '
-        'weder finanzielle Ziele verfolgt, noch will man mit mir der Seite oder Anderen Schaden zufügen. Die Anzeigen '
-        'und jeglicher Inhalt befinden sich weiterhin auf wg-gesucht.de und der Kontakt zu den Inserenten findet auch '
-        'dort statt.'.format(all_cities),
-        parse_mode=ParseMode.MARKDOWN,
+        'Huhu, ich bin dein Telegram Helferchen Bot für wg-gesucht.de.\n'
+        'Schreib einfach "/subscribe muc" für Anzeigen aus München oder {} für andere Städte.\n'
+        'Ich wünsche viel Erfolg bei der Wohnungssuche.\n\n'
+        'Ich bin NICHT von wg-gesucht, sondern ein privates Projekt, um Wohnungssuchenden zu helfen. Mit mir werden '
+        'weder finanzielle Ziele verfolgt, noch Daten gespeichert, noch will man mit mir der Seite oder Anderen Schaden '
+        'zufügen.'.format(all_cities_string)
     )
 
 
@@ -437,15 +523,15 @@ def current_ads_cmd(bot: Bot, update: Update):
             update.message.reply_text(chunk)
 
 
-# def current_offers_count(bot: Bot, update: Update):
-#     offercounts = {city: len(offers) for city, offers in current_offers.items()}
-#     print(offercounts)
-#     update.message.reply_text(json.dumps(offercounts))
-
-
 def error(bot: Bot, update: Update, error):
     """Log Errors caused by Updates."""
-    logging.warning('Update "%s" caused error "%s"', update, error)
+    try:
+        logging.warning('Update "%s" caused error "%s"', update, error)
+    except TimedOut:
+        pass
+    except Unauthorized as e:
+        # TODO kill user
+        logging.warning('Threw out user {} because of Unauthorized Error')
 
 
 def main(event, context):
@@ -463,7 +549,7 @@ def main(event, context):
                         level=logging.INFO)
     logging.info('starting bot')
 
-    updater = Updater(token=params.tmptest_bot_token)
+    updater = Updater(token=params.tmptest_bot_token, workers=12)
 
     # all handlers need to be added to dispatcher, order matters
     dispatcher = updater.dispatcher
@@ -480,6 +566,8 @@ def main(event, context):
         # more filters for the users?
         CommandHandler('filter_rent', filter_rent),
         CommandHandler('filter_sex', filter_sex),
+        CommandHandler('filter_from', filter_from),
+        CommandHandler('filter_to', filter_to),
 
         # admin queries
         CommandHandler('scrape_begin', scrape_begin_all, pass_job_queue=True, pass_chat_data=True,
